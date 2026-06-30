@@ -1,0 +1,722 @@
+# QSWAP LP-Incentives - unified diff vs clean core-main-June-23-2026 (~560 added, 0 removed)
+
+diff --git a/Qswap.h b/Qswap.h
+index 8f1009a..0d3811a 100644
+--- a/Qswap.h
++++ b/Qswap.h
+@@ -19,6 +19,7 @@ constexpr sint64 QSWAP_MIN_LIQUIDITY = 1000;
+ constexpr sint64 QSWAP_ADDITIONAL_FEE = 100000;
+ constexpr uint32 QSWAP_SWAP_FEE_BASE = 10000;
+ constexpr uint32 QSWAP_FEE_BASE_100 = 100;
++constexpr uint64 QSWAP_INCENTIVE_HIST_BUCKETS = 64;   // LP-incentives: volume-histogram resolution for the bottom-% cutoff
+ 
+ struct QSWAP2
+ {
+@@ -77,6 +78,8 @@ public:
+ 		sint64 reservedAssetAmount;
+ 		sint64 totalLiquidity;
+ 		uint128 accFeePerLPX64;
++		uint64 volumeQuEpoch;           // LP-incentives: QU-denominated swap volume this epoch (reset in END_EPOCH)
++		uint128 accIncentivePerLPX64;   // LP-incentives: running incentive-per-LP, X64 fixed point (mirrors accFeePerLPX64)
+ 	};
+ 
+ 	struct LiquidityInfo
+@@ -84,6 +87,8 @@ public:
+ 		sint64 liquidity;
+ 		uint128 feeDebtX64;
+ 		uint64 accumulatedFee;
++		uint128 incentiveDebtX64;       // LP-incentives: accIncentivePerLPX64 snapshot at this position's last touch
++		uint64 accumulatedIncentive;    // LP-incentives: settled-but-unclaimed incentive in QU (realized by ClaimIncentive / remove)
+ 	};
+ 
+ 	struct StateData
+@@ -114,6 +119,12 @@ public:
+ 
+ 		uint32 cachedIssuanceFee;
+ 		uint32 cachedTransferFee;
++
++		// LP-incentives: recaptured SC dividends (QCAP from QVAULT, QMINE from qRWA, and any future stray QU)
++		// redistributed each epoch to the LPs of the most-active pools. See PROPOSAL.md / DESIGN.md.
++		uint64 mIncentiveUnclaimed;            // total earmarked-but-unclaimed incentive; EXCLUDED from the END_EPOCH sweep
++		uint64 mIncentiveLifetimeDistributed;  // stat: cumulative incentive ever credited to pools
++		uint32 mIncentiveBottomPctExcluded;    // bottom-volume percentile of participating pools that gets nothing (INITIALIZE: 30)
+ 	};
+ 
+ 	struct FindPoolSlotReadOnly_input
+@@ -1050,6 +1061,7 @@ protected:
+ 		uint128 i1, i2, i3;
+ 
+ 		uint128 pendingFeeX64;
++		uint128 pendingIncX64;          // LP-incentives
+ 		FindPoolSlotReadOnly_input fspIn;
+ 		FindPoolSlotReadOnly_output fspOut;
+ 	};
+@@ -1315,6 +1327,7 @@ protected:
+ 			{
+ 				locals.tmpLiquidity.liquidity = locals.increaseLiquidity;
+ 				locals.tmpLiquidity.feeDebtX64 = locals.poolBasicState.accFeePerLPX64;
++				locals.tmpLiquidity.incentiveDebtX64 = locals.poolBasicState.accIncentivePerLPX64;   // LP-incentives: new record starts at the current accumulator (no retroactive claim)
+ 				state.mut().mLiquidities.add(liquidityPov(locals.poolID, qpi.invocator(), locals.r), locals.tmpLiquidity, 0);
+ 			}
+ 			else
+@@ -1322,8 +1335,11 @@ protected:
+ 				locals.tmpLiquidity = state.get().mLiquidities.element(locals.userLiquidityElementIndex);
+ 				locals.pendingFeeX64 = uint128(locals.tmpLiquidity.liquidity) * (locals.poolBasicState.accFeePerLPX64 - locals.tmpLiquidity.feeDebtX64);
+ 				locals.tmpLiquidity.accumulatedFee += locals.pendingFeeX64.high;
++				locals.pendingIncX64 = uint128(locals.tmpLiquidity.liquidity) * (locals.poolBasicState.accIncentivePerLPX64 - locals.tmpLiquidity.incentiveDebtX64);   // LP-incentives: settle pending on OLD liquidity (top-up STACKS rewards, never pays)
++				locals.tmpLiquidity.accumulatedIncentive += locals.pendingIncX64.high;
+ 				locals.tmpLiquidity.liquidity += locals.increaseLiquidity;
+ 				locals.tmpLiquidity.feeDebtX64 = locals.poolBasicState.accFeePerLPX64;
++				locals.tmpLiquidity.incentiveDebtX64 = locals.poolBasicState.accIncentivePerLPX64;   // LP-incentives: re-snapshot debt
+ 				state.mut().mLiquidities.replace(locals.userLiquidityElementIndex, locals.tmpLiquidity);
+ 			}
+ 
+@@ -1368,6 +1384,8 @@ protected:
+ 
+ 		uint32 i0;
+ 		uint128 pendingFeeX64;
++		uint128 pendingIncX64;          // LP-incentives
++		sint64 incentivePayout;         // LP-incentives: auto-claim amount paid on remove
+ 		FindPoolSlotReadOnly_input fspIn;
+ 		FindPoolSlotReadOnly_output fspOut;
+ 	};
+@@ -1472,6 +1490,27 @@ protected:
+ 
+ 		// modify invocator's liquidity info
+ 		locals.pendingFeeX64 = uint128(locals.userLiquidity.liquidity) * (locals.poolBasicState.accFeePerLPX64 - locals.userLiquidity.feeDebtX64);
++
++		// LP-incentives: AUTO-CLAIM accrued incentive on ANY remove (partial or full) — settle on the OLD
++		// liquidity, pay it out, then reset. So a remove always sweeps the LP's rewards to their wallet,
++		// and a full exit never strands them (the record is removed only AFTER payout).
++		locals.pendingIncX64 = uint128(locals.userLiquidity.liquidity) * (locals.poolBasicState.accIncentivePerLPX64 - locals.userLiquidity.incentiveDebtX64);
++		locals.incentivePayout = sint64(locals.userLiquidity.accumulatedIncentive + locals.pendingIncX64.high);
++		if (locals.incentivePayout > 0)
++		{
++			qpi.transfer(qpi.invocator(), locals.incentivePayout);
++			if (state.get().mIncentiveUnclaimed >= uint64(locals.incentivePayout))
++			{
++				state.mut().mIncentiveUnclaimed -= uint64(locals.incentivePayout);
++			}
++			else
++			{
++				state.mut().mIncentiveUnclaimed = 0;
++			}
++		}
++		locals.userLiquidity.accumulatedIncentive = 0;
++		locals.userLiquidity.incentiveDebtX64 = locals.poolBasicState.accIncentivePerLPX64;
++
+ 		locals.userLiquidity.liquidity -= input.burnLiquidity;
+ 		if (locals.userLiquidity.liquidity == 0)
+ 		{
+@@ -1638,6 +1677,7 @@ protected:
+ 		locals.scaledLpFee.high = locals.swapFee.low - locals.totalFee;
+ 		locals.scaledLpFee.low = 0;
+ 		locals.poolBasicState.accFeePerLPX64 += div(locals.scaledLpFee, uint128(locals.poolBasicState.totalLiquidity));
++		locals.poolBasicState.volumeQuEpoch += locals.quAmountIn;   // LP-incentives: accrue QU swap volume (END_EPOCH ranking)
+ 		state.mut().mPoolBasicStates.set(locals.poolSlot, locals.poolBasicState);
+ 
+ 		// Log SwapExactQuForAsset procedure
+@@ -1795,6 +1835,7 @@ protected:
+ 		locals.scaledLpFee.high = locals.swapFee.low - locals.totalFee;
+ 		locals.scaledLpFee.low = 0;
+ 		locals.poolBasicState.accFeePerLPX64 += div(locals.scaledLpFee, uint128(locals.poolBasicState.totalLiquidity));
++		locals.poolBasicState.volumeQuEpoch += locals.quAmountIn;   // LP-incentives: accrue QU swap volume (END_EPOCH ranking)
+ 		state.mut().mPoolBasicStates.set(locals.poolSlot, locals.poolBasicState);
+ 
+ 		// Log SwapQuForExactAsset procedure
+@@ -2000,6 +2041,7 @@ protected:
+ 		// update pool states
+ 		locals.poolBasicState.reservedAssetAmount += input.assetAmountIn;
+ 		locals.totalFee = locals.quAmountOut + sint64(locals.feeToShareholders.low) + sint64(locals.feeToQx.low) + sint64(locals.feeToInvestRewards.low) + sint64(locals.feeToBurn.low);
++		locals.poolBasicState.volumeQuEpoch += locals.quAmountOut;   // LP-incentives: accrue QU swap volume (END_EPOCH ranking)
+ 		if (locals.poolBasicState.reservedQuAmount < locals.totalFee)
+ 		{
+ 			locals.poolBasicState.reservedQuAmount = 0;
+@@ -2213,6 +2255,7 @@ protected:
+ 		// update pool states
+ 		locals.poolBasicState.reservedAssetAmount += locals.assetAmountIn;
+ 		locals.totalFee = input.quAmountOut + sint64(locals.feeToShareholders.low) + sint64(locals.feeToQx.low) + sint64(locals.feeToInvestRewards.low) + sint64(locals.feeToBurn.low);
++		locals.poolBasicState.volumeQuEpoch += input.quAmountOut;   // LP-incentives: accrue QU swap volume (END_EPOCH ranking)
+ 		if (locals.poolBasicState.reservedQuAmount < locals.totalFee)
+ 		{
+ 			locals.poolBasicState.reservedQuAmount = 0;
+@@ -2361,6 +2404,141 @@ protected:
+ 		}
+ 	}
+ 
++	// ===== LP-incentives: read-only claimable view (function index 9) =====
++	struct GetClaimableIncentive_input
++	{
++		id assetIssuer;
++		uint64 assetName;
++		id account;
++	};
++	struct GetClaimableIncentive_output
++	{
++		sint64 claimableQu;        // accumulatedIncentive + pending, in QU (what ClaimIncentive/remove would pay now)
++		uint64 accIncentivePerLP;  // pool's running incentive-per-LP (>> 64), for clients
++		uint64 poolVolumeEpoch;    // pool's QU volume accrued this epoch so far
++	};
++	struct GetClaimableIncentive_locals
++	{
++		id poolID;
++		id liqPov;
++		id r;
++		sint64 liqElementIndex;
++		sint64 poolSlot;
++		PoolBasicState pbs;
++		LiquidityInfo li;
++		uint128 pendingIncX64;
++		FindPoolSlotReadOnly_input  fsRoIn;
++		FindPoolSlotReadOnly_output fsRoOut;
++	};
++	PUBLIC_FUNCTION_WITH_LOCALS(GetClaimableIncentive)
++	{
++		output.claimableQu = 0;
++		output.accIncentivePerLP = 0;
++		output.poolVolumeEpoch = 0;
++
++		locals.poolID = input.assetIssuer;
++		locals.poolID.u64._3 = input.assetName;
++
++		locals.fsRoIn.assetIssuer = input.assetIssuer;
++		locals.fsRoIn.assetName = input.assetName;
++		CALL(FindPoolSlotReadOnly, locals.fsRoIn, locals.fsRoOut);
++		locals.poolSlot = locals.fsRoOut.poolSlot;
++		if (locals.poolSlot == NULL_INDEX)
++		{
++			return;
++		}
++		locals.pbs = state.get().mPoolBasicStates.get(locals.poolSlot);
++		output.accIncentivePerLP = locals.pbs.accIncentivePerLPX64.high;
++		output.poolVolumeEpoch = locals.pbs.volumeQuEpoch;
++
++		locals.liqPov = liquidityPov(locals.poolID, input.account, locals.r);
++		locals.liqElementIndex = state.get().mLiquidities.headIndex(locals.liqPov, 0);
++		if (locals.liqElementIndex == NULL_INDEX)
++		{
++			return;
++		}
++		locals.li = state.get().mLiquidities.element(locals.liqElementIndex);
++		locals.pendingIncX64 = uint128(locals.li.liquidity) * (locals.pbs.accIncentivePerLPX64 - locals.li.incentiveDebtX64);
++		output.claimableQu = sint64(locals.li.accumulatedIncentive + locals.pendingIncX64.high);
++	}
++
++	// ===== LP-incentives: claim accrued incentive WITHOUT removing liquidity (procedure index 12) =====
++	struct ClaimIncentive_input
++	{
++		id assetIssuer;
++		uint64 assetName;
++	};
++	struct ClaimIncentive_output
++	{
++		sint64 claimedQu;
++	};
++	struct ClaimIncentive_locals
++	{
++		id poolID;
++		id liqPov;
++		id r;
++		sint64 liqElementIndex;
++		sint64 poolSlot;
++		PoolBasicState pbs;
++		LiquidityInfo li;
++		uint128 pendingIncX64;
++		sint64 payout;
++		FindPoolSlotReadOnly_input  fsRoIn;
++		FindPoolSlotReadOnly_output fsRoOut;
++	};
++	PUBLIC_PROCEDURE_WITH_LOCALS(ClaimIncentive)
++	{
++		output.claimedQu = 0;
++
++		// claiming carries no fee — refund anything the caller attached
++		if (qpi.invocationReward() > 0)
++		{
++			qpi.transfer(qpi.invocator(), qpi.invocationReward());
++		}
++
++		locals.poolID = input.assetIssuer;
++		locals.poolID.u64._3 = input.assetName;
++
++		locals.fsRoIn.assetIssuer = input.assetIssuer;
++		locals.fsRoIn.assetName = input.assetName;
++		CALL(FindPoolSlotReadOnly, locals.fsRoIn, locals.fsRoOut);
++		locals.poolSlot = locals.fsRoOut.poolSlot;
++		if (locals.poolSlot == NULL_INDEX)
++		{
++			return;
++		}
++		locals.pbs = state.get().mPoolBasicStates.get(locals.poolSlot);
++
++		locals.liqPov = liquidityPov(locals.poolID, qpi.invocator(), locals.r);
++		locals.liqElementIndex = state.get().mLiquidities.headIndex(locals.liqPov, 0);
++		if (locals.liqElementIndex == NULL_INDEX)
++		{
++			return;
++		}
++		locals.li = state.get().mLiquidities.element(locals.liqElementIndex);
++
++		// settle pending on current liquidity, pay it out, reset — liquidity untouched (claim while still providing)
++		locals.pendingIncX64 = uint128(locals.li.liquidity) * (locals.pbs.accIncentivePerLPX64 - locals.li.incentiveDebtX64);
++		locals.payout = sint64(locals.li.accumulatedIncentive + locals.pendingIncX64.high);
++		if (locals.payout > 0)
++		{
++			qpi.transfer(qpi.invocator(), locals.payout);
++			if (state.get().mIncentiveUnclaimed >= uint64(locals.payout))
++			{
++				state.mut().mIncentiveUnclaimed -= uint64(locals.payout);
++			}
++			else
++			{
++				state.mut().mIncentiveUnclaimed = 0;
++			}
++		}
++		locals.li.accumulatedIncentive = 0;
++		locals.li.incentiveDebtX64 = locals.pbs.accIncentivePerLPX64;
++		state.mut().mLiquidities.replace(locals.liqElementIndex, locals.li);
++
++		output.claimedQu = locals.payout;
++	}
++
+ 	REGISTER_USER_FUNCTIONS_AND_PROCEDURES()
+ 	{
+ 		// functions
+@@ -2372,6 +2550,7 @@ protected:
+ 		REGISTER_USER_FUNCTION(QuoteExactAssetInput, 6);
+ 		REGISTER_USER_FUNCTION(QuoteExactAssetOutput, 7);
+ 		REGISTER_USER_FUNCTION(InvestRewardsInfo, 8);
++		REGISTER_USER_FUNCTION(GetClaimableIncentive, 9);
+ 
+ 		// procedure
+ 		REGISTER_USER_PROCEDURE(IssueAsset, 1);
+@@ -2385,6 +2564,7 @@ protected:
+ 		REGISTER_USER_PROCEDURE(SwapAssetForExactQu, 9);
+ 		REGISTER_USER_PROCEDURE(SetInvestRewardsInfo, 10);
+ 		REGISTER_USER_PROCEDURE(TransferShareManagementRights, 11);
++		REGISTER_USER_PROCEDURE(ClaimIncentive, 12);
+ 	}
+ 
+ 	INITIALIZE()
+@@ -2402,6 +2582,7 @@ protected:
+ 		ASSERT(state.get().shareholderFeeRate + state.get().investRewardsFeeRate + state.get().qxFeeRate + state.get().burnFeeRate <= 100);
+ 		//
+         state.mut().investRewardsId = ID(_V, _J, _G, _R, _U, _F, _W, _J, _C, _U, _S, _N, _H, _C, _Q, _J, _R, _W, _R, _R, _Y, _X, _A, _U, _E, _J, _F, _C, _V, _H, _Y, _P, _X, _W, _K, _T, _D, _L, _Y, _K, _U, _A, _C, _P, _V, _V, _Y, _B, _G, _O, _L, _V, _C, _J, _S, _F);
++		state.mut().mIncentiveBottomPctExcluded = 30;   // LP-incentives: bottom 30% of participating pools (by volume) receive nothing
+ 	}
+ 
+ 	struct BEGIN_EPOCH_locals
+@@ -2485,6 +2666,183 @@ protected:
+ 		}
+ 	}
+ 
++	struct END_EPOCH_locals
++	{
++		Entity entity;
++		PoolBasicState p;
++		Array<uint32, QSWAP_INCENTIVE_HIST_BUCKETS> bucketCount;
++		uint64 balance;
++		uint64 totalReserved;
++		uint64 undistFees;
++		uint64 stray;
++		uint64 maxVol;
++		uint64 qualVol;
++		uint64 distributed;
++		uint64 poolShare;
++		uint64 target;
++		uint64 cum;
++		uint64 vbucket;
++		uint128 num;
++		sint64 i;
++		sint64 participating;
++		uint32 b;
++		uint32 cutoff;
++	};
++
++	// LP-incentives: once per epoch, recapture the QU that has quietly landed in the contract (recovered SC
++	// dividends — QCAP from QVAULT, QMINE from qRWA — plus, on the first run, the whole historical backlog)
++	// and credit it to the LPs of the most-active pools, volume-weighted, dropping the bottom % by volume.
++	// The capture is balance-based, so it is independent of WHO sent the QU or WHEN — anything unaccounted is
++	// swept on the next epoch. LPs realize it lazily via accIncentivePerLPX64 (claim / remove); nothing here
++	// transfers QU out, so this cannot fail a payout.
++	END_EPOCH_WITH_LOCALS()
++	{
++		qpi.getEntity(SELF, locals.entity);
++		locals.balance = locals.entity.incomingAmount - locals.entity.outgoingAmount;
++
++		// pass 1: total reserved QU across pools + participating-pool stats (participating = traded this epoch)
++		locals.totalReserved = 0;
++		locals.participating = 0;
++		locals.maxVol = 0;
++		for (locals.i = 0; locals.i < (sint64)QSWAP_MAX_POOL; locals.i++)
++		{
++			locals.p = state.get().mPoolBasicStates.get(locals.i);
++			if (locals.p.poolID == NULL_ID)
++			{
++				continue;
++			}
++			locals.totalReserved += locals.p.reservedQuAmount;
++			if (locals.p.volumeQuEpoch > 0 && locals.p.totalLiquidity > 0)
++			{
++				locals.participating++;
++				if (locals.p.volumeQuEpoch > locals.maxVol)
++				{
++					locals.maxVol = locals.p.volumeQuEpoch;
++				}
++			}
++		}
++
++		// still-owed fee buckets are NOT incentive money; nor is already-earmarked incentive
++		locals.undistFees = (state.get().shareholderEarnedFee - state.get().shareholderDistributedAmount)
++			+ (state.get().investRewardsEarnedFee - state.get().investRewardsDistributedAmount)
++			+ (state.get().qxEarnedFee - state.get().qxDistributedAmount)
++			+ (state.get().burnEarnedFee - state.get().burnedAmount);
++
++		// stray = unaccounted QU = recaptured dividends (and the backlog on the first run)
++		locals.stray = 0;
++		if (locals.balance > locals.totalReserved + locals.undistFees + state.get().mIncentiveUnclaimed)
++		{
++			locals.stray = locals.balance - locals.totalReserved - locals.undistFees - state.get().mIncentiveUnclaimed;
++		}
++
++		if (locals.stray > 0 && locals.participating > 0 && locals.maxVol > 0)
++		{
++			// pass 2: bucket participating-pool volumes (bucket = vol*NB/maxVol, clamped to NB-1)
++			for (locals.b = 0; locals.b < QSWAP_INCENTIVE_HIST_BUCKETS; locals.b++)
++			{
++				locals.bucketCount.set(locals.b, 0);
++			}
++			for (locals.i = 0; locals.i < (sint64)QSWAP_MAX_POOL; locals.i++)
++			{
++				locals.p = state.get().mPoolBasicStates.get(locals.i);
++				if (locals.p.poolID == NULL_ID || locals.p.volumeQuEpoch == 0 || locals.p.totalLiquidity <= 0)
++				{
++					continue;
++				}
++				locals.vbucket = div(uint128(locals.p.volumeQuEpoch) * uint128(QSWAP_INCENTIVE_HIST_BUCKETS), uint128(locals.maxVol)).low;
++				if (locals.vbucket >= QSWAP_INCENTIVE_HIST_BUCKETS)
++				{
++					locals.vbucket = QSWAP_INCENTIVE_HIST_BUCKETS - 1;
++				}
++				locals.bucketCount.set(locals.vbucket, uint32(locals.bucketCount.get(locals.vbucket) + 1));
++			}
++
++			// cutoff bucket: smallest b such that pools in buckets [0..b-1] already cover the bottom %
++			locals.target = div(uint64(locals.participating) * uint64(state.get().mIncentiveBottomPctExcluded), 100ULL);
++			locals.cum = 0;
++			locals.cutoff = 0;
++			for (locals.b = 0; locals.b < QSWAP_INCENTIVE_HIST_BUCKETS; locals.b++)
++			{
++				if (locals.cum >= locals.target)
++				{
++					locals.cutoff = locals.b;
++					break;
++				}
++				locals.cum += locals.bucketCount.get(locals.b);
++			}
++
++			// pass 3: total volume of qualifying (top) pools
++			locals.qualVol = 0;
++			for (locals.i = 0; locals.i < (sint64)QSWAP_MAX_POOL; locals.i++)
++			{
++				locals.p = state.get().mPoolBasicStates.get(locals.i);
++				if (locals.p.poolID == NULL_ID || locals.p.volumeQuEpoch == 0 || locals.p.totalLiquidity <= 0)
++				{
++					continue;
++				}
++				locals.vbucket = div(uint128(locals.p.volumeQuEpoch) * uint128(QSWAP_INCENTIVE_HIST_BUCKETS), uint128(locals.maxVol)).low;
++				if (locals.vbucket >= QSWAP_INCENTIVE_HIST_BUCKETS)
++				{
++					locals.vbucket = QSWAP_INCENTIVE_HIST_BUCKETS - 1;
++				}
++				if (locals.vbucket >= locals.cutoff)
++				{
++					locals.qualVol += locals.p.volumeQuEpoch;
++				}
++			}
++
++			// pass 4: credit each qualifying pool its volume-weighted share via accIncentivePerLPX64
++			if (locals.qualVol > 0)
++			{
++				locals.distributed = 0;
++				for (locals.i = 0; locals.i < (sint64)QSWAP_MAX_POOL; locals.i++)
++				{
++					locals.p = state.get().mPoolBasicStates.get(locals.i);
++					if (locals.p.poolID == NULL_ID || locals.p.volumeQuEpoch == 0 || locals.p.totalLiquidity <= 0)
++					{
++						continue;
++					}
++					locals.vbucket = div(uint128(locals.p.volumeQuEpoch) * uint128(QSWAP_INCENTIVE_HIST_BUCKETS), uint128(locals.maxVol)).low;
++					if (locals.vbucket >= QSWAP_INCENTIVE_HIST_BUCKETS)
++					{
++						locals.vbucket = QSWAP_INCENTIVE_HIST_BUCKETS - 1;
++					}
++					if (locals.vbucket < locals.cutoff)
++					{
++						continue;
++					}
++					locals.poolShare = div(uint128(locals.stray) * uint128(locals.p.volumeQuEpoch), uint128(locals.qualVol)).low;
++					if (locals.poolShare > 0)
++					{
++						locals.num.high = locals.poolShare;   // num = poolShare << 64 (X64), mirrors scaledLpFee
++						locals.num.low = 0;
++						locals.p.accIncentivePerLPX64 += div(locals.num, uint128(locals.p.totalLiquidity));
++						state.mut().mPoolBasicStates.set(locals.i, locals.p);
++						locals.distributed += locals.poolShare;
++					}
++				}
++				state.mut().mIncentiveUnclaimed += locals.distributed;
++				state.mut().mIncentiveLifetimeDistributed += locals.distributed;
++				// rounding dust (stray - distributed) stays in the contract and is swept again next epoch
++			}
++		}
++
++		// pass 5: reset per-epoch volumes (always)
++		for (locals.i = 0; locals.i < (sint64)QSWAP_MAX_POOL; locals.i++)
++		{
++			locals.p = state.get().mPoolBasicStates.get(locals.i);
++			if (locals.p.poolID == NULL_ID)
++			{
++				continue;
++			}
++			if (locals.p.volumeQuEpoch != 0)
++			{
++				locals.p.volumeQuEpoch = 0;
++				state.mut().mPoolBasicStates.set(locals.i, locals.p);
++			}
++		}
++	}
++
+ 	PRE_ACQUIRE_SHARES()
+     {
+ 		output.allowTransfer = true;
+diff --git a/contract_qswap.cpp b/contract_qswap.cpp
+index a9615bb..09b58c4 100644
+--- a/contract_qswap.cpp
++++ b/contract_qswap.cpp
+@@ -30,6 +30,8 @@ constexpr uint32 SWAP_EXACT_ASSET_FOR_QU_IDX = 8;
+ constexpr uint32 SWAP_ASSET_FOR_EXACT_QU_IDX = 9;
+ constexpr uint32 SET_INVEST_REWARDS_INFO_IDX = 10;
+ constexpr uint32 TRANSFER_SHARE_MANAGEMENT_RIGHTS_IDX = 11;
++constexpr uint32 GET_CLAIMABLE_INCENTIVE_IDX = 9;   // LP-incentives (function)
++constexpr uint32 CLAIM_INCENTIVE_IDX = 12;          // LP-incentives (procedure)
+ 
+ 
+ class QswapChecker : public QSWAP, public QSWAP::StateData
+@@ -243,6 +245,50 @@ public:
+ 		callFunction(QSWAP_CONTRACT_INDEX, QUOTE_EXACT_ASSET_OUTPUT_IDX, input, output);
+ 		return output;
+     }
++
++    // ---- LP-incentives helpers ----
++    void endEpoch(bool expectSuccess = true)
++    {
++        callSystemProcedure(QSWAP_CONTRACT_INDEX, END_EPOCH, expectSuccess);
++    }
++
++    QSWAP::GetClaimableIncentive_output getClaimableIncentive(const id& issuer, uint64 assetName, const id& account)
++    {
++        QSWAP::GetClaimableIncentive_input input{ issuer, assetName, account };
++        QSWAP::GetClaimableIncentive_output output;
++        callFunction(QSWAP_CONTRACT_INDEX, GET_CLAIMABLE_INCENTIVE_IDX, input, output);
++        return output;
++    }
++
++    QSWAP::ClaimIncentive_output claimIncentive(const id& invocator, const id& issuer, uint64 assetName)
++    {
++        QSWAP::ClaimIncentive_input input{ issuer, assetName };
++        QSWAP::ClaimIncentive_output output;
++        invokeUserProcedure(QSWAP_CONTRACT_INDEX, CLAIM_INCENTIVE_IDX, input, output, invocator, 0);
++        return output;
++    }
++
++    // issue asset + create pool + add initial liquidity (assetAmt asset + quAmt QU); `lp` issues & provides
++    void setupPoolWithLiquidity(const id& lp, uint64 assetName, sint64 numShares, sint64 assetAmt, sint64 quAmt)
++    {
++        increaseEnergy(lp, QSWAP_ISSUE_ASSET_FEE);
++        QSWAP::IssueAsset_input ia{ assetName, numShares, 0, 0 };
++        issueAsset(lp, ia);
++        increaseEnergy(lp, QSWAP_CREATE_POOL_FEE);
++        createPool(lp, assetName);
++        sint64 iv = quAmt + QSWAP_ADDITIONAL_FEE;
++        increaseEnergy(lp, iv);
++        QSWAP::AddLiquidity_input al{ lp, assetName, assetAmt, 0, 0 };
++        addLiquidity(lp, al, iv);
++    }
++
++    void swapQuIn(const id& user, const id& issuer, uint64 assetName, sint64 quIn)
++    {
++        sint64 iv = quIn + QSWAP_ADDITIONAL_FEE;
++        increaseEnergy(user, iv);
++        QSWAP::SwapExactQuForAsset_input si{ issuer, assetName, 0 };
++        swapExactQuForAsset(user, si, iv);
++    }
+ };
+ 
+ TEST(ContractSwap, InvestRewardsInfoTest)
+@@ -810,4 +856,164 @@ TEST(ContractSwap, LiqTest2)
+         EXPECT_EQ(output.quAmount, 0);
+         EXPECT_EQ(output.assetAmount, 0);
+     }
++}
++
++// ============================ LP-incentives tests ============================
++
++// volume accrues per swap and resets on END_EPOCH
++TEST(ContractSwap, Incentive_VolumeTrackingAndReset)
++{
++    ContractTestingQswap qswap;
++    id issuer(1, 2, 3, 4);
++    id user(5, 6, 7, 8);
++    uint64 name = assetNameFromString("VOL0");
++    qswap.setupPoolWithLiquidity(issuer, name, 100000 * 1000, 100 * 1000, 200 * 1000);
++
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).poolVolumeEpoch, (uint64)0);
++    qswap.swapQuIn(user, issuer, name, 50 * 1000);
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).poolVolumeEpoch, (uint64)(50 * 1000));
++    qswap.swapQuIn(user, issuer, name, 30 * 1000);
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).poolVolumeEpoch, (uint64)(80 * 1000));
++
++    qswap.endEpoch();  // no stray injected -> nothing distributed, volume resets
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).poolVolumeEpoch, (uint64)0);
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).claimableQu, (sint64)0);
++}
++
++// the core: sweep stray QU, drop bottom 30% by volume, split the rest volume-weighted
++TEST(ContractSwap, Incentive_SweepWeightedDistribution_BottomExcluded)
++{
++    ContractTestingQswap qswap;
++    id issuer(1, 2, 3, 4);
++    id user(5, 6, 7, 8);
++    uint64 nA = assetNameFromString("POOLA"), nB = assetNameFromString("POOLB");
++    uint64 nC = assetNameFromString("POOLC"), nD = assetNameFromString("POOLD");
++    sint64 numShares = 100000 * 1000, assetAmt = 100 * 1000, quAmt = 200 * 1000;
++    qswap.setupPoolWithLiquidity(issuer, nA, numShares, assetAmt, quAmt);
++    qswap.setupPoolWithLiquidity(issuer, nB, numShares, assetAmt, quAmt);
++    qswap.setupPoolWithLiquidity(issuer, nC, numShares, assetAmt, quAmt);
++    qswap.setupPoolWithLiquidity(issuer, nD, numShares, assetAmt, quAmt);
++
++    qswap.swapQuIn(user, issuer, nA, 300 * 1000);  // volumes 300k/200k/100k/10k
++    qswap.swapQuIn(user, issuer, nB, 200 * 1000);
++    qswap.swapQuIn(user, issuer, nC, 100 * 1000);
++    qswap.swapQuIn(user, issuer, nD, 10 * 1000);
++
++    sint64 stray = 6 * 1000 * 1000;
++    increaseEnergy(QSWAP_CONTRACT_ID, stray);
++    uint64 lifeBefore = qswap.getState()->mIncentiveLifetimeDistributed;
++    qswap.endEpoch();
++    uint64 distributed = qswap.getState()->mIncentiveLifetimeDistributed - lifeBefore;
++
++    // bottom pool D (10k vs 100-300k): 4 pools -> exclude floor(4*0.3)=1 -> D gets nothing
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, nD, issuer).accIncentivePerLP, (uint64)0);
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, nD, issuer).claimableQu, (sint64)0);
++
++    sint64 clA = qswap.getClaimableIncentive(issuer, nA, issuer).claimableQu;
++    sint64 clB = qswap.getClaimableIncentive(issuer, nB, issuer).claimableQu;
++    sint64 clC = qswap.getClaimableIncentive(issuer, nC, issuer).claimableQu;
++    EXPECT_GT(clA, clB);
++    EXPECT_GT(clB, clC);
++    EXPECT_GT(clC, 0);
++    EXPECT_NEAR((double)clA / (double)clC, 3.0, 0.05);   // weighted 300:200:100 = 3:2:1
++    EXPECT_NEAR((double)clB / (double)clC, 2.0, 0.05);
++    EXPECT_GE(distributed, (uint64)(stray - 10));         // ~all distributed (dust < #pools)
++    EXPECT_LE(distributed, (uint64)stray);
++    EXPECT_GT(clA + clB + clC, (sint64)((double)distributed * 0.98));
++    EXPECT_LE(clA + clB + clC, (sint64)distributed);
++
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, nA, issuer).poolVolumeEpoch, (uint64)0);  // volumes reset
++}
++
++// the ~4.65M backlog: stray that arrived before any END_EPOCH is swept on the first run
++TEST(ContractSwap, Incentive_BacklogSweptOnFirstEpoch)
++{
++    ContractTestingQswap qswap;
++    id issuer(1, 2, 3, 4);
++    id user(5, 6, 7, 8);
++    uint64 name = assetNameFromString("BKLOG");
++    qswap.setupPoolWithLiquidity(issuer, name, 100000 * 1000, 100 * 1000, 200 * 1000);
++    qswap.swapQuIn(user, issuer, name, 100 * 1000);  // give it volume so it qualifies
++
++    sint64 backlog = 4646728;  // the measured on-chain figure
++    increaseEnergy(QSWAP_CONTRACT_ID, backlog);
++    qswap.endEpoch();
++
++    sint64 cl = qswap.getClaimableIncentive(issuer, name, issuer).claimableQu;  // sole pool -> ~entire backlog
++    EXPECT_GT(cl, (sint64)((double)backlog * 0.98));
++    EXPECT_LE(cl, (sint64)backlog);
++    EXPECT_GE(qswap.getState()->mIncentiveLifetimeDistributed, (uint64)(backlog - 5));
++}
++
++// claim pays QU to the LP, decrements the unclaimed pool, and a second claim pays nothing
++TEST(ContractSwap, Incentive_ClaimPaysOutAndZeroes)
++{
++    ContractTestingQswap qswap;
++    id issuer(1, 2, 3, 4);
++    id user(5, 6, 7, 8);
++    uint64 name = assetNameFromString("CLAIM");
++    qswap.setupPoolWithLiquidity(issuer, name, 100000 * 1000, 100 * 1000, 200 * 1000);
++    qswap.swapQuIn(user, issuer, name, 100 * 1000);
++    increaseEnergy(QSWAP_CONTRACT_ID, 1000000);
++    qswap.endEpoch();
++
++    sint64 claimable = qswap.getClaimableIncentive(issuer, name, issuer).claimableQu;
++    EXPECT_GT(claimable, 0);
++    uint64 lpBefore = getBalance(issuer);
++    uint64 unclaimedBefore = qswap.getState()->mIncentiveUnclaimed;
++
++    QSWAP::ClaimIncentive_output out = qswap.claimIncentive(issuer, issuer, name);
++    EXPECT_EQ(out.claimedQu, claimable);
++    EXPECT_EQ(getBalance(issuer), lpBefore + (uint64)claimable);
++    EXPECT_EQ(qswap.getState()->mIncentiveUnclaimed, unclaimedBefore - (uint64)claimable);
++
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).claimableQu, (sint64)0);  // second claim: nothing
++    EXPECT_EQ(qswap.claimIncentive(issuer, issuer, name).claimedQu, (sint64)0);
++}
++
++// removing liquidity auto-claims the accrued incentive to the LP's wallet
++TEST(ContractSwap, Incentive_AutoClaimOnRemove)
++{
++    ContractTestingQswap qswap;
++    id issuer(1, 2, 3, 4);
++    id user(5, 6, 7, 8);
++    uint64 name = assetNameFromString("RMCLM");
++    qswap.setupPoolWithLiquidity(issuer, name, 100000 * 1000, 100 * 1000, 200 * 1000);
++    qswap.swapQuIn(user, issuer, name, 100 * 1000);
++    increaseEnergy(QSWAP_CONTRACT_ID, 1000000);
++    qswap.endEpoch();
++
++    sint64 claimable = qswap.getClaimableIncentive(issuer, name, issuer).claimableQu;
++    EXPECT_GT(claimable, 0);
++
++    uint64 lpBefore = getBalance(issuer);
++    increaseEnergy(issuer, QSWAP_ADDITIONAL_FEE);
++    QSWAP::RemoveLiquidity_input rl{ issuer, name, 1000, 0, 0 };  // burn a small slice
++    qswap.removeLiquidity(issuer, rl, QSWAP_ADDITIONAL_FEE);
++    uint64 lpAfter = getBalance(issuer);
++    EXPECT_GE(lpAfter, lpBefore + (uint64)claimable);  // wallet gained at least the incentive (+ burned QU)
++    EXPECT_EQ(qswap.getClaimableIncentive(issuer, name, issuer).claimableQu, (sint64)0);
++}
++
++// not claiming lets rewards stack across epochs
++TEST(ContractSwap, Incentive_StacksAcrossEpochs)
++{
++    ContractTestingQswap qswap;
++    id issuer(1, 2, 3, 4);
++    id user(5, 6, 7, 8);
++    uint64 name = assetNameFromString("STACK");
++    qswap.setupPoolWithLiquidity(issuer, name, 100000 * 1000, 100 * 1000, 200 * 1000);
++
++    qswap.swapQuIn(user, issuer, name, 100 * 1000);
++    increaseEnergy(QSWAP_CONTRACT_ID, 1000000);
++    qswap.endEpoch();
++    sint64 afterE1 = qswap.getClaimableIncentive(issuer, name, issuer).claimableQu;
++    EXPECT_GT(afterE1, 0);
++
++    qswap.swapQuIn(user, issuer, name, 100 * 1000);   // second epoch, no claim in between -> claimable grows
++    increaseEnergy(QSWAP_CONTRACT_ID, 1000000);
++    qswap.endEpoch();
++    sint64 afterE2 = qswap.getClaimableIncentive(issuer, name, issuer).claimableQu;
++    EXPECT_GT(afterE2, afterE1);
++    EXPECT_NEAR((double)afterE2 / (double)afterE1, 2.0, 0.05);
+ }
+\ No newline at end of file
